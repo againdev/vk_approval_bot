@@ -5,24 +5,23 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  url      = env("MAIN_DATABASE_URL")
+  url      = env("DATABASE_URL")
 }
 
-model User {
-  id              String   @id @default(uuid()) @db.Uuid
-  tgId            BigInt   @unique
-  firstName       String
-  lastName        String?
-  username        String?
-  isPremium       Boolean? @default(false)
-  languageCode    String?
-  allowsWriteToPm Boolean? @default(false)
-  photoUrl        String?
-  clientSeed      String  @unique
-  ban             Boolean  @default(false)
+model Task {
+  id            String   @id @default(uuid()) @db.Uuid
+  userToId      String
+  chatId        String
+  firstName     String
+  lastName      String
+  text          String?
+  fileCaption   String?
+  fileId        String?
+  status        String
+  remindInterval Int     
+  lastRemind    DateTime @default(now())
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@index([id, tgId, isPremium])
+  @@index([id])
 }
