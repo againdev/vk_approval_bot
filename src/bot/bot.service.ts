@@ -31,7 +31,7 @@ export class BotService {
   }
 
   private startPolling() {
-    const pollTime = 5;
+    const pollTime = 3;
     const interval = setInterval(async () => {
       try {
         this.logger.log(`Polling events with lastEventId: ${this.lastEventId}`);
@@ -76,7 +76,7 @@ export class BotService {
         for (const task of tasks) {
           try {
             const message = `У вас есть задача на утверждение: ${task.text}`;
-            await this.sendReminderWithButtons(task.chatId, task.id);
+            await this.sendReminderWithButtons(task.userToId, task.id);
 
             const newLastRemind = new Date(
               now.getTime() + task.remindInterval * 60 * 1000,
@@ -234,6 +234,9 @@ export class BotService {
     if (userState) {
       const { step, taskData } = JSON.parse(userState);
 
+      let urlParts;
+      let contactId;
+
       switch (step) {
         case USER_STEPS.AWAITING_DESCRIPTION:
           taskData.description = text;
@@ -250,31 +253,106 @@ export class BotService {
             3600,
           );
           responseText =
-            'Отправьте ссылку на контакт из ваших контактов, кому нужно назначить задачу:';
+            'Отправьте контакт из ваших контактов, кому нужно назначить задачу:';
           break;
 
         case USER_STEPS.AWAITING_USER_ID:
-          const urlParts = text.split('/');
-          const contactId = urlParts[urlParts.length - 1];
+          urlParts = text.split('/');
+          contactId = urlParts[urlParts.length - 1];
 
           if (!contactId || !contactId.includes('@')) {
             responseText =
-              'Некорректная ссылка. Отправьте ссылку на контакт из ваших контактов.';
+              'Некорректная ссылка. Отправьте контакт из ваших контактов.';
             break;
           }
 
-          taskData.userId = contactId;
-          if (file) {
-            taskData.fileId = file.fileId;
-            taskData.fileCaption = file.caption;
+          try {
+            const user = await this.prisma.user.findUnique({
+              where: { vkId: contactId },
+            });
+
+            if (!user) {
+              responseText = 'Пользователь с таким userId не найден.';
+              break;
+            }
+
+            taskData.userId = contactId;
+            if (file) {
+              taskData.fileId = file.fileId;
+              taskData.fileCaption = file.caption;
+            }
+
+            await redis.set(
+              chatId,
+              JSON.stringify({ step: USER_STEPS.AWAITING_TIME, taskData }),
+              'EX',
+              3600,
+            );
+            responseText = 'Введите интервал напоминания в минутах:';
+          } catch (error) {
+            this.logger.error(
+              `Ошибка при проверке пользователя: ${error.message}`,
+            );
+            responseText =
+              'Произошла ошибка при проверке вашего аккаунта. Попробуйте снова.';
           }
-          await redis.set(
-            chatId,
-            JSON.stringify({ step: USER_STEPS.AWAITING_TIME, taskData }),
-            'EX',
-            3600,
-          );
-          responseText = 'Введите интервал напоминания в минутах:';
+          break;
+
+        case USER_STEPS.AWAITING_USER_ID_FOR_TASKS:
+          urlParts = text.split('/');
+          contactId = urlParts[urlParts.length - 1];
+
+          if (!contactId || !contactId.includes('@')) {
+            responseText =
+              'Некорректная ссылка. Отправьте контакт из ваших контактов.';
+            break;
+          }
+
+          try {
+            const userToCheck = await this.prisma.user.findUnique({
+              where: { vkId: contactId },
+            });
+
+            if (!userToCheck) {
+              responseText = 'Пользователь с таким userId не найден.';
+              break;
+            }
+
+            const tasks = await this.prisma.task.findMany({
+              where: {
+                userToId: contactId,
+              },
+              orderBy: {
+                createdAt: 'desc',
+              },
+              take: 10,
+            });
+
+            if (tasks.length === 0) {
+              responseText = `У пользователя ${userToCheck.firstName} ${userToCheck.lastName} нет задач.`;
+            } else {
+              responseText = `📝 *Последние 10 задач пользователя ${userToCheck.firstName} ${userToCheck.lastName}:*\n\n`;
+
+              for (const task of tasks) {
+                const assignedUser = await this.prisma.user.findUnique({
+                  where: { vkId: task.userToId },
+                });
+
+                responseText +=
+                  `*Задача ${tasks.indexOf(task) + 1}:*\n` +
+                  `*Описание:* ${task.text ? task.text : task.fileCaption || 'Описание отсутствует'}\n` +
+                  `*Для кого:* ${assignedUser ? `${assignedUser.firstName} ${assignedUser.lastName}` : 'Неизвестный пользователь'}\n` +
+                  `*Статус:* ${task.status === 'APPROVED' ? 'Подтверждена' : task.status === 'REJECTED' ? 'Отклонена' : 'В ожидании'}\n` +
+                  `*Создано:* ${task.createdAt.toLocaleString()}\n\n`;
+              }
+            }
+
+            await redis.del(chatId);
+          } catch (error) {
+            this.logger.error(`Ошибка при получении задач: ${error.message}`);
+            responseText =
+              'Произошла ошибка при получении задач. Попробуйте снова.';
+          }
           break;
 
         case USER_STEPS.AWAITING_TIME:
@@ -325,6 +403,29 @@ export class BotService {
       switch (command) {
         case '/start':
           await redis.del(chatId);
+
+          const { firstName, lastName } = event.payload.from;
+
+          try {
+            await this.prisma.user.upsert({
+              where: { vkId: chatId },
+              update: {},
+              create: {
+                vkId: chatId,
+                firstName,
+                lastName,
+              },
+            });
+            this.logger.log(
+              `Пользователь ${chatId} добавлен или уже существует.`,
+            );
+          } catch (error) {
+            this.logger.error(
+              `Ошибка при добавлении пользователя: ${error.message}`,
+            );
+            throw error;
+          }
+
           responseText = `Добро пожаловать! Выберите команду:`;
           inlineKeyboardMarkup = [
             [
@@ -333,12 +434,24 @@ export class BotService {
                 callbackData: 'create_task',
                 style: 'primary',
               },
+              {
+                text: 'Посмотреть задачи пользователя',
+                callbackData: 'check_user_tasks',
+                style: 'primary',
+              },
             ],
             [
               {
-                text: 'Просмотреть задачи',
+                text: 'Просмотреть последние задачи',
                 callbackData: 'watch_tasks',
-                style: 'attention',
+                style: 'primary',
+              },
+            ],
+            [
+              {
+                text: 'Просмотреть статистику',
+                callbackData: 'watch_statistics',
+                style: 'primary',
               },
             ],
           ];
@@ -394,6 +507,10 @@ export class BotService {
     let responseText: string;
 
     const redis = this.redisService.getOrThrow();
+    const userState = await redis.get(chatId);
+    const { step, taskData } = userState
+      ? JSON.parse(userState)
+      : { step: null, taskData: {} };
 
     if (
       callbackData.startsWith('approve_') ||
@@ -437,14 +554,104 @@ export class BotService {
         case 'create_task':
           await redis.set(
             chatId,
-            JSON.stringify({ step: 'awaitingDescription', taskData: {} }),
+            JSON.stringify({
+              step: USER_STEPS.AWAITING_DESCRIPTION,
+              taskData: {},
+            }),
           );
           responseText = 'Введите описание задачи:';
           break;
 
         case 'watch_tasks':
-          responseText =
-            'Команда для просмотра последних задач. Вот список последних задач: ...';
+          try {
+            const tasks = await this.prisma.task.findMany({
+              where: {
+                chatId: userId,
+              },
+              orderBy: {
+                createdAt: 'desc',
+              },
+              take: 10,
+            });
+
+            if (tasks.length === 0) {
+              responseText = 'У вас нет созданных задач.';
+            } else {
+              responseText = '📝 *Последние 10 задач:*\n\n';
+
+              for (const task of tasks) {
+                const assignedUser = await this.prisma.user.findUnique({
+                  where: { vkId: task.userToId },
+                });
+
+                responseText +=
+                  `*Задача ${tasks.indexOf(task) + 1}:*\n` +
+                  `*Описание:* ${task.text ? task.text : task.fileCaption || 'Описание отсутствует'}\n` +
+                  `*Для кого:* ${assignedUser ? `${assignedUser.firstName} ${assignedUser.lastName}` : 'Неизвестный пользователь'}\n` +
+                  `*Статус:* ${task.status === 'APPROVED' ? 'Подтверждена' : task.status === 'REJECTED' ? 'Отклонена' : 'В ожидании'}\n` +
+                  `*Создано:* ${task.createdAt.toLocaleString()}\n\n`;
+              }
+            }
+          } catch (error) {
+            this.logger.error(`Ошибка при получении задач: ${error.message}`);
+            responseText =
+              'Произошла ошибка при получении задач. Попробуйте снова.';
+          }
+          break;
+
+        case 'check_user_tasks':
+          await redis.set(
+            chatId,
+            JSON.stringify({
+              step: USER_STEPS.AWAITING_USER_ID_FOR_TASKS,
+              taskData: {},
+            }),
+          );
+          responseText = 'Отправьте контакт пользователя:';
+          break;
+
+        case 'watch_statistics':
+          try {
+            const totalTasks = await this.prisma.task.count({
+              where: {
+                chatId: userId,
+              },
+            });
+
+            const approvedTasks = await this.prisma.task.count({
+              where: {
+                chatId: userId,
+                status: 'APPROVED',
+              },
+            });
+
+            const rejectedTasks = await this.prisma.task.count({
+              where: {
+                chatId: userId,
+                status: 'REJECTED',
+              },
+            });
+
+            const pendingTasks = await this.prisma.task.count({
+              where: {
+                chatId: userId,
+                status: 'PENDING',
+              },
+            });
+
+            responseText =
+              `📊 *Статистика по вашим задачам:*\n\n` +
+              `• Всего создано задач: ${totalTasks}\n` +
+              `• Одобрено: ${approvedTasks}\n` +
+              `• Отклонено: ${rejectedTasks}\n` +
+              `• В ожидании: ${pendingTasks}`;
+          } catch (error) {
+            this.logger.error(
+              `Ошибка при получении статистики: ${error.message}`,
+            );
+            responseText =
+              'Произошла ошибка при получении статистики. Попробуйте снова.';
+          }
           break;
 
         default:
